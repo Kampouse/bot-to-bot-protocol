@@ -198,5 +198,5 @@ app.get('/api/v1/stats', (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Bot-to-Bot Protocol API running on port ${PORT} (in-memory mode)`);
+  console.log(`Bot-to-Bot Protocol API v1.1 running on port ${PORT} (in-memory mode)`);
 });
