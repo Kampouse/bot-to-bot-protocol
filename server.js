@@ -1,22 +1,22 @@
 const express = require('express');
-const Redis = require('ioredis');
-const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.use(express.json());
 
-// Redis connection
-const redis = new Redis(process.env.REDIS_URL || 'redis://localhost:6379');
+// In-memory storage (for testing without Redis)
+const registry = new Map();
+const inboxes = new Map();
+const outboxes = new Map();
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', timestamp: Date.now() });
+  res.json({ status: 'ok', timestamp: Date.now(), mode: 'memory' });
 });
 
 // Register bot
-app.post('/api/v1/register', async (req, res) => {
+app.post('/api/v1/register', (req, res) => {
   const { bot_id, owner_id, platform, pubkey, endpoint } = req.body;
-  
+
   if (!bot_id || !owner_id) {
     return res.status(400).json({ error: 'bot_id and owner_id required' });
   }
@@ -32,29 +32,22 @@ app.post('/api/v1/register', async (req, res) => {
     status: 'online'
   };
 
-  await redis.hset(`bot:registry:${bot_id}`, ...Object.entries(registration).flat());
-  
+  registry.set(bot_id, registration);
+
   res.json({ status: 'registered', bot_id });
 });
 
 // List all registered bots
-app.get('/api/v1/registry', async (req, res) => {
-  const keys = await redis.keys('bot:registry:*');
-  const bots = [];
-
-  for (const key of keys) {
-    const bot = await redis.hgetall(key);
-    bots.push(bot);
-  }
-
+app.get('/api/v1/registry', (req, res) => {
+  const bots = Array.from(registry.values());
   res.json({ bots, count: bots.length });
 });
 
 // Get bot info
-app.get('/api/v1/registry/:bot_id', async (req, res) => {
-  const bot = await redis.hgetall(`bot:registry:${req.params.bot_id}`);
-  
-  if (!bot || Object.keys(bot).length === 0) {
+app.get('/api/v1/registry/:bot_id', (req, res) => {
+  const bot = registry.get(req.params.bot_id);
+
+  if (!bot) {
     return res.status(404).json({ error: 'Bot not found' });
   }
 
@@ -62,7 +55,7 @@ app.get('/api/v1/registry/:bot_id', async (req, res) => {
 });
 
 // Send message to bot
-app.post('/api/v1/send', async (req, res) => {
+app.post('/api/v1/send', (req, res) => {
   const { to, from, message, conversation_id, ttl = 3600 } = req.body;
 
   if (!to || !from || !message) {
@@ -70,8 +63,8 @@ app.post('/api/v1/send', async (req, res) => {
   }
 
   // Check if recipient exists
-  const recipient = await redis.hgetall(`bot:registry:${to}`);
-  if (!recipient || Object.keys(recipient).length === 0) {
+  const recipient = registry.get(to);
+  if (!recipient) {
     return res.status(404).json({ error: 'Recipient bot not registered' });
   }
 
@@ -82,8 +75,8 @@ app.post('/api/v1/send', async (req, res) => {
 
   const messageObj = {
     version: '1.0',
-    message_id: uuidv4(),
-    conversation_id: conversation_id || uuidv4(),
+    message_id: require('uuid').v4(),
+    conversation_id: conversation_id || require('uuid').v4(),
     timestamp: Date.now(),
     ttl,
     from: {
@@ -102,82 +95,74 @@ app.post('/api/v1/send', async (req, res) => {
   };
 
   // Push to recipient's inbox
-  await redis.rpush(`bot:inbox:${to}`, JSON.stringify(messageObj));
-  
+  if (!inboxes.has(to)) {
+    inboxes.set(to, []);
+  }
+  inboxes.get(to).push(messageObj);
+
   // Store in sender's outbox
-  await redis.rpush(`bot:outbox:${from.bot_id || from}`, JSON.stringify(messageObj));
+  const senderId = from.bot_id || from;
+  if (!outboxes.has(senderId)) {
+    outboxes.set(senderId, []);
+  }
+  outboxes.get(senderId).push(messageObj);
 
   // Update sender's last_seen
-  await redis.hset(`bot:registry:${from.bot_id || from}`, 'last_seen', Date.now());
+  if (registry.has(senderId)) {
+    registry.get(senderId).last_seen = Date.now();
+  }
 
-  res.json({ 
-    status: 'queued', 
+  res.json({
+    status: 'queued',
     message_id: messageObj.message_id,
-    conversation_id: messageObj.conversation_id 
+    conversation_id: messageObj.conversation_id
   });
 });
 
 // Get inbox
-app.get('/api/v1/inbox/:bot_id', async (req, res) => {
+app.get('/api/v1/inbox/:bot_id', (req, res) => {
   const { bot_id } = req.params;
-  const messages = await redis.lrange(`bot:inbox:${bot_id}`, 0, -1);
+  const messages = inboxes.get(bot_id) || [];
 
   // Parse and filter expired messages
   const now = Date.now();
-  const valid = [];
-  const expired = [];
-
-  for (const msgStr of messages) {
-    const msg = JSON.parse(msgStr);
-    if (now - msg.timestamp > msg.ttl * 1000) {
-      expired.push(msg.message_id);
-    } else {
-      valid.push(msg);
-    }
-  }
-
-  // Remove expired messages
-  if (expired.length > 0) {
-    await redis.ltrim(`bot:inbox:${bot_id}`, valid.length, -1);
-  }
+  const valid = messages.filter(msg => now - msg.timestamp <= msg.ttl * 1000);
 
   // Update last_seen
-  await redis.hset(`bot:registry:${bot_id}`, 'last_seen', Date.now());
+  if (registry.has(bot_id)) {
+    registry.get(bot_id).last_seen = Date.now();
+  }
 
   res.json({ messages: valid, count: valid.length });
 });
 
 // Acknowledge message (delete from inbox)
-app.post('/api/v1/ack', async (req, res) => {
+app.post('/api/v1/ack', (req, res) => {
   const { bot_id, message_id } = req.body;
 
   if (!bot_id || !message_id) {
     return res.status(400).json({ error: 'bot_id and message_id required' });
   }
 
-  // Get all messages
-  const messages = await redis.lrange(`bot:inbox:${bot_id}`, 0, -1);
-  
-  // Find and remove the message
-  for (const msgStr of messages) {
-    const msg = JSON.parse(msgStr);
-    if (msg.message_id === message_id) {
-      await redis.lrem(`bot:inbox:${bot_id}`, 1, msgStr);
-      return res.json({ status: 'acked', message_id });
-    }
+  const messages = inboxes.get(bot_id) || [];
+  const index = messages.findIndex(msg => msg.message_id === message_id);
+
+  if (index === -1) {
+    return res.status(404).json({ error: 'Message not found' });
   }
 
-  res.status(404).json({ error: 'Message not found' });
+  messages.splice(index, 1);
+  res.json({ status: 'acked', message_id });
 });
 
 // Clear inbox
-app.delete('/api/v1/inbox/:bot_id', async (req, res) => {
-  await redis.del(`bot:inbox:${req.params.bot_id}`);
+app.delete('/api/v1/inbox/:bot_id', (req, res) => {
+  inboxes.delete(req.params.bot_id);
   res.json({ status: 'cleared' });
 });
 
 // Set bot status
-app.post('/api/v1/status', async (req, res) => {
+app.post('/api/v1/status', (req, res) => {
   const { bot_id, status } = req.body;
 
   if (!bot_id || !status) {
@@ -188,28 +173,30 @@ app.post('/api/v1/status', async (req, res) => {
     return res.status(400).json({ error: 'status must be online, offline, or busy' });
   }
 
-  await redis.hset(`bot:registry:${bot_id}`, 'status', status);
+  if (!registry.has(bot_id)) {
+    return res.status(404).json({ error: 'Bot not registered' });
+  }
+
+  registry.get(bot_id).status = status;
   res.json({ status: 'updated', bot_id, new_status: status });
 });
 
 // Stats
-app.get('/api/v1/stats', async (req, res) => {
-  const registryKeys = await redis.keys('bot:registry:*');
-  const inboxKeys = await redis.keys('bot:inbox:*');
-  
+app.get('/api/v1/stats', (req, res) => {
   let totalMessages = 0;
-  for (const key of inboxKeys) {
-    totalMessages += await redis.llen(key);
+  for (const messages of inboxes.values()) {
+    totalMessages += messages.length;
   }
 
   res.json({
-    registered_bots: registryKeys.length,
-    active_inboxes: inboxKeys.length,
-    pending_messages: totalMessages
+    registered_bots: registry.size,
+    active_inboxes: inboxes.size,
+    pending_messages: totalMessages,
+    mode: 'memory'
   });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Bot-to-Bot Protocol API running on port ${PORT}`);
+  console.log(`Bot-to-Bot Protocol API running on port ${PORT} (in-memory mode)`);
 });
